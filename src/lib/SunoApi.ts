@@ -64,14 +64,29 @@ class SunoApi {
    * Get the session ID and save it for later use.
    */
   private async getAuthToken() {
-    // URL to get session ID
+    // Try extracting sid from the __session JWT cookie first (avoids needing the __client cookie).
+    const cookieStr = (this.client.defaults.headers as any)['Cookie'] || '';
+    const m = cookieStr.match(/(?:^|;\s*)__session=([^;]+)/);
+    if (m) {
+      try {
+        const jwt = m[1];
+        const payloadB64 = jwt.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+        const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
+        if (payload.sid) {
+          this.sid = payload.sid;
+          this.currentToken = jwt;
+          return;
+        }
+      } catch (e) {
+        logger.warn({ err: String(e) }, 'Failed to decode __session JWT, falling back to Clerk API');
+      }
+    }
+    // Fallback: ask Clerk for the session id
     const getSessionUrl = `${SunoApi.CLERK_BASE_URL}/v1/client?_clerk_js_version=4.73.2`;
-    // Get session ID
     const sessionResponse = await this.client.get(getSessionUrl);
     if (!sessionResponse?.data?.response?.['last_active_session_id']) {
       throw new Error("Failed to get session id, you may need to update the SUNO_COOKIE");
     }
-    // Save session ID for later use
     this.sid = sessionResponse.data.response['last_active_session_id'];
   }
 
@@ -83,17 +98,23 @@ class SunoApi {
     if (!this.sid) {
       throw new Error("Session ID is not set. Cannot renew token.");
     }
-    // URL to renew session token
     const renewUrl = `${SunoApi.CLERK_BASE_URL}/v1/client/sessions/${this.sid}/tokens?_clerk_js_version==4.73.2`;
-    // Renew session token
-    const renewResponse = await this.client.post(renewUrl);
-    logger.info("KeepAlive...\n");
-    if (isWait) {
-      await sleep(1, 2);
+    try {
+      const renewResponse = await this.client.post(renewUrl);
+      logger.info("KeepAlive...\n");
+      if (isWait) {
+        await sleep(1, 2);
+      }
+      const newToken = renewResponse.data['jwt'];
+      this.currentToken = newToken;
+    } catch (e) {
+      // If renew fails (e.g. cookie not scoped to Clerk), keep the JWT from the __session cookie.
+      if (this.currentToken) {
+        logger.warn({ err: String(e) }, 'KeepAlive renew failed; reusing JWT from __session cookie');
+      } else {
+        throw e;
+      }
     }
-    const newToken = renewResponse.data['jwt'];
-    // Update Authorization field in request header with the new JWT token
-    this.currentToken = newToken;
   }
 
   /**
